@@ -208,3 +208,5 @@ __marimo__/
 
 # my files or folders
 data_input/
+.agents/
+skills-lock.json

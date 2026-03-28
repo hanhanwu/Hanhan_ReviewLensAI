@@ -14,6 +14,8 @@
 * Create frontend folder by running`npx create-expo-app review_lens_frontend --template blank`
 * `cd review_lens_frontend/`
   * `npx expo install react-dom react-native-web` to install modules for web development
+* Connect with Nero (external serverless psql)
+  * `npx neonctl@latest init`
 
 #### Test Local Website
 * Open terminal 1 and type `uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000` to start FastAPI server
