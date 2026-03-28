@@ -15,6 +15,7 @@
 * `cd review_lens_frontend/`
   * `npx expo install react-dom react-native-web` to install modules for web development
 * Connect with Nero (external serverless psql)
+  * I chose `AWS US West 2` --> Later Railway region should also be "US West", otherwise higher latency and potentially more costs
   * `npx neonctl@latest init`
 
 #### Test Local Website
