@@ -54,7 +54,6 @@ export default function App() {
   const [dbAggregates, setDbAggregates] = useState<DbAggregates | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [message, setMessage] = useState("Waiting for a CSV upload.");
   const [loadingBackend, setLoadingBackend] = useState(false);
   const [loadingDb, setLoadingDb] = useState(false);
 
@@ -69,7 +68,6 @@ export default function App() {
     setDbAggregates(null);
     setLoading(true);
     setError(null);
-    setMessage("Uploading…");
 
     try {
       const formData = new FormData();
@@ -91,10 +89,8 @@ export default function App() {
 
       const payload: UploadResponse = await response.json();
       setUpload(payload);
-      setMessage("Upload saved to database.");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Upload failed.");
-      setMessage("Upload failed.");
     } finally {
       setLoading(false);
       event.target.value = "";
@@ -192,11 +188,7 @@ export default function App() {
         contentContainerStyle={styles.scrollContent}
         keyboardShouldPersistTaps="handled"
       >
-        <Text style={styles.title}>ReviewLens Data Uploader</Text>
-        <Text style={styles.subtitle}>
-          Upload a CSV file. The backend stores it in Postgres, then shows
-          aggregated stats (backend) and aggregated query results (database).
-        </Text>
+        <Text style={styles.title}>ReviewLens</Text>
 
         {Platform.OS === "web" && canUploadAgain ? (
           <>
@@ -207,11 +199,6 @@ export default function App() {
               disabled={loading}
               style={fileInputStyle}
             />
-            {upload && (
-              <Text style={styles.note}>
-                Upload another CSV to replace the current results.
-              </Text>
-            )}
           </>
         ) : Platform.OS !== "web" ? (
           <Text style={styles.note}>
@@ -220,15 +207,6 @@ export default function App() {
           </Text>
         ) : null}
 
-        {upload && (
-          <View style={styles.savedPill}>
-            <Text style={styles.savedText}>
-              Saved: {upload.filename ?? "uploaded.csv"} (upload_id: {upload.upload_id})
-            </Text>
-          </View>
-        )}
-
-        <Text style={styles.message}>{message}</Text>
         {error && <Text style={styles.error}>{error}</Text>}
 
         {upload && (
@@ -363,26 +341,9 @@ const styles = StyleSheet.create({
     textAlign: "center",
     maxWidth: 420,
   },
-  message: {
-    marginTop: 12,
-    fontSize: 14,
-    color: "#333",
-  },
   error: {
     marginTop: 8,
     color: "#d93025",
-  },
-  savedPill: {
-    marginTop: 16,
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    borderRadius: 999,
-    backgroundColor: "#111827",
-    maxWidth: 820,
-  },
-  savedText: {
-    color: "#fff",
-    fontSize: 12,
   },
   dashboard: {
     marginTop: 24,
