@@ -1,6 +1,17 @@
 import React, { ChangeEvent, CSSProperties, useEffect, useMemo, useState } from "react";
 import { StatusBar } from "expo-status-bar";
-import { Platform, SafeAreaView, ScrollView, StyleSheet, Text, View } from "react-native";
+import {
+  NativeSyntheticEvent,
+  Platform,
+  Pressable,
+  SafeAreaView,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TextInputKeyPressEventData,
+  View,
+} from "react-native";
 
 const BACKEND_URL = "http://127.0.0.1:8000";
 
@@ -36,6 +47,16 @@ type DbAggregates = {
   rating_counts: Array<{ rating: string; count: number }>;
 };
 
+type ChatMessage = {
+  role: "user" | "assistant";
+  content: string;
+};
+
+type ChatResponse = {
+  answer: string;
+  model: string | null;
+};
+
 const fileInputStyle: CSSProperties = {
   padding: 12,
   borderRadius: 8,
@@ -56,6 +77,10 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [loadingBackend, setLoadingBackend] = useState(false);
   const [loadingDb, setLoadingDb] = useState(false);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatScrollRef, setChatScrollRef] = useState<ScrollView | null>(null);
 
   const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -66,6 +91,8 @@ export default function App() {
     setUpload(null);
     setBackendStats(null);
     setDbAggregates(null);
+    setChatMessages([]);
+    setChatInput("");
     setLoading(true);
     setError(null);
 
@@ -166,6 +193,10 @@ export default function App() {
     };
   }, [upload?.upload_id]);
 
+  useEffect(() => {
+    chatScrollRef?.scrollToEnd({ animated: true });
+  }, [chatMessages, chatLoading, chatScrollRef]);
+
   const missingList = useMemo(() => {
     if (!backendStats?.missing_by_column) return [];
     return Object.entries(backendStats.missing_by_column)
@@ -173,13 +204,65 @@ export default function App() {
       .slice(0, 12);
   }, [backendStats?.missing_by_column]);
 
-  const columnCountsList = useMemo(() => {
-    if (!dbAggregates?.column_value_counts) return [];
-    return dbAggregates.column_value_counts.slice(0, 12);
-  }, [dbAggregates?.column_value_counts]);
-
   const hasLeftData = !!backendStats;
   const titleStyle = hasLeftData ? [styles.title, styles.titleLeft] : styles.title;
+
+  const sendChatMessage = async () => {
+    const question = chatInput.trim();
+    if (!upload?.upload_id || !question || chatLoading) {
+      return;
+    }
+
+    const nextHistory = [...chatMessages, { role: "user" as const, content: question }];
+    setChatMessages(nextHistory);
+    setChatInput("");
+    setChatLoading(true);
+    setError(null);
+
+    try {
+      const response = await fetch(`${BACKEND_URL}/uploads/${upload.upload_id}/chat`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          question,
+          history: chatMessages,
+        }),
+      });
+
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        const detail =
+          payload && typeof payload.detail === "string"
+            ? payload.detail
+            : "Failed to get chatbot response.";
+        throw new Error(detail);
+      }
+
+      const payload: ChatResponse = await response.json();
+      setChatMessages((current) => [
+        ...current,
+        { role: "assistant", content: payload.answer || "I don't know" },
+      ]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Chat request failed.");
+      setChatMessages((current) => [
+        ...current,
+        { role: "assistant", content: "I don't know" },
+      ]);
+    } finally {
+      setChatLoading(false);
+    }
+  };
+
+  const handleChatKeyPress = (
+    event: NativeSyntheticEvent<TextInputKeyPressEventData>
+  ) => {
+    if (event.nativeEvent.key === "Enter") {
+      void sendChatMessage();
+    }
+  };
 
   return (
     <SafeAreaView style={styles.screen}>
@@ -273,49 +356,65 @@ export default function App() {
             </View>
 
             <View style={styles.panel}>
-              <Text style={styles.panelTitle}>Database Aggregates</Text>
-              {loadingDb && <Text style={styles.panelHint}>Loading...</Text>}
-              {dbAggregates && (
-                <View>
-                  <Text style={styles.kvLabel}>Rows in DB</Text>
-                  <Text style={styles.kvValue}>{dbAggregates.rows_count}</Text>
-                  <Text style={styles.kvLabel}>Columns (from CSV)</Text>
-                  <Text style={styles.kvValue}>{dbAggregates.columns_count}</Text>
-
-                  <Text style={styles.sectionTitle}>Column Value Counts</Text>
-                  {columnCountsList.length === 0 ? (
-                    <Text style={styles.panelHint}>No database aggregates.</Text>
-                  ) : (
-                    columnCountsList.map((c) => (
-                      <Text key={c.column} style={styles.listItem}>
-                        {c.column}: {c.non_null_count} non-null ({c.present_count} present)
+              <Text style={styles.panelTitle}>Data Chatbot</Text>
+              <Text style={styles.panelHint}>
+                Ask about the uploaded dataset stored in the database.
+              </Text>
+              {loadingDb && <Text style={styles.panelHint}>Loading data context...</Text>}
+              <ScrollView
+                ref={setChatScrollRef}
+                style={styles.chatMessages}
+                contentContainerStyle={styles.chatMessagesContent}
+                onContentSizeChange={() =>
+                  chatScrollRef?.scrollToEnd({ animated: true })
+                }
+                keyboardShouldPersistTaps="handled"
+              >
+                {chatMessages.length === 0 ? (
+                  <Text style={styles.chatEmpty}>
+                    Try questions like "How many rows are in the data?" or "What ratings
+                    appear most often?"
+                  </Text>
+                ) : (
+                  chatMessages.map((message, index) => (
+                    <View
+                      key={`${message.role}-${index}`}
+                      style={[
+                        styles.chatBubble,
+                        message.role === "user"
+                          ? styles.chatBubbleUser
+                          : styles.chatBubbleAssistant,
+                      ]}
+                    >
+                      <Text style={styles.chatRole}>
+                        {message.role === "user" ? "You" : "ReviewLens Bot"}
                       </Text>
-                    ))
-                  )}
-
-                  {dbAggregates.rating_category_counts?.length > 0 && (
-                    <>
-                      <Text style={styles.sectionTitle}>Rating Categories</Text>
-                      {dbAggregates.rating_category_counts.slice(0, 8).map((r) => (
-                        <Text key={r.category} style={styles.listItem}>
-                          {r.category}: {r.count}
-                        </Text>
-                      ))}
-                    </>
-                  )}
-
-                  {dbAggregates.rating_counts?.length > 0 && (
-                    <>
-                      <Text style={styles.sectionTitle}>Ratings</Text>
-                      {dbAggregates.rating_counts.slice(0, 8).map((r) => (
-                        <Text key={r.rating} style={styles.listItem}>
-                          {r.rating}: {r.count}
-                        </Text>
-                      ))}
-                    </>
-                  )}
-                </View>
-              )}
+                      <Text style={styles.chatText}>{message.content}</Text>
+                    </View>
+                  ))
+                )}
+                {chatLoading && <Text style={styles.panelHint}>Thinking...</Text>}
+              </ScrollView>
+              <View style={styles.chatInputRow}>
+                <TextInput
+                  value={chatInput}
+                  onChangeText={setChatInput}
+                  placeholder="Ask about this dataset"
+                  placeholderTextColor="#7a7a7a"
+                  style={styles.chatInput}
+                  editable={!chatLoading && !!upload?.upload_id}
+                  multiline
+                  blurOnSubmit={false}
+                  onKeyPress={handleChatKeyPress}
+                />
+                <Pressable
+                  style={[styles.chatSendButton, chatLoading && styles.chatSendButtonDisabled]}
+                  onPress={sendChatMessage}
+                  disabled={chatLoading || !upload?.upload_id}
+                >
+                  <Text style={styles.chatSendText}>Send</Text>
+                </Pressable>
+              </View>
             </View>
           </View>
         )}
@@ -428,5 +527,75 @@ const styles = StyleSheet.create({
   uploadBelowLeft: {
     marginTop: 18,
     alignItems: "flex-start",
+  },
+  chatMessages: {
+    marginTop: 8,
+    minHeight: 320,
+    maxHeight: 420,
+  },
+  chatMessagesContent: {
+    gap: 10,
+  },
+  chatEmpty: {
+    color: "#555",
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  chatBubble: {
+    borderRadius: 14,
+    padding: 12,
+  },
+  chatBubbleUser: {
+    backgroundColor: "#e7f0ff",
+    alignSelf: "flex-end",
+    maxWidth: "88%",
+  },
+  chatBubbleAssistant: {
+    backgroundColor: "#f4f4f4",
+    alignSelf: "flex-start",
+    maxWidth: "92%",
+  },
+  chatRole: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#475569",
+    marginBottom: 4,
+    textTransform: "uppercase",
+  },
+  chatText: {
+    fontSize: 14,
+    lineHeight: 20,
+    color: "#111",
+  },
+  chatInputRow: {
+    marginTop: 14,
+    flexDirection: "row",
+    alignItems: "flex-end",
+    gap: 10,
+  },
+  chatInput: {
+    flex: 1,
+    minHeight: 88,
+    borderWidth: 1,
+    borderColor: "#cbd5e1",
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    backgroundColor: "#fff",
+    textAlignVertical: "top",
+  },
+  chatSendButton: {
+    alignSelf: "flex-end",
+    backgroundColor: "#1f4fd1",
+    paddingHorizontal: 18,
+    paddingVertical: 10,
+    borderRadius: 10,
+  },
+  chatSendButtonDisabled: {
+    opacity: 0.6,
+  },
+  chatSendText: {
+    color: "#fff",
+    fontWeight: "700",
   },
 });

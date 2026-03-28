@@ -317,3 +317,79 @@ def get_db_aggregates(upload_id: uuid.UUID) -> Dict[str, Any]:
                 "rating_category_counts": rating_category_counts,
                 "rating_counts": rating_counts,
             }
+
+
+def get_chat_context(upload_id: uuid.UUID, *, max_rows: int = 150) -> Dict[str, Any]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT filename, created_at, rows_count, columns_count, column_names, backend_stats
+                FROM uploads
+                WHERE upload_id = %s;
+                """,
+                (upload_id,),
+            )
+            meta = cur.fetchone()
+            if not meta:
+                raise KeyError("upload not found")
+
+            filename, created_at, rows_count, columns_count, column_names, backend_stats = meta
+
+            cur.execute(
+                """
+                SELECT row_number, data
+                FROM upload_rows
+                WHERE upload_id = %s
+                ORDER BY row_number ASC
+                LIMIT %s;
+                """,
+                (upload_id, max_rows),
+            )
+            sample_rows = [
+                {"row_number": int(row_number), "data": data}
+                for row_number, data in cur.fetchall()
+            ]
+
+            return {
+                "upload_id": str(upload_id),
+                "filename": filename,
+                "created_at": created_at.isoformat() if created_at else None,
+                "rows_count": int(rows_count),
+                "columns_count": int(columns_count),
+                "column_names": list(column_names or []),
+                "backend_stats": backend_stats or {},
+                "sample_rows": sample_rows,
+                "sample_rows_count": len(sample_rows),
+            }
+
+
+def get_upload_rows(upload_id: uuid.UUID, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if limit is None:
+                cur.execute(
+                    """
+                    SELECT row_number, data
+                    FROM upload_rows
+                    WHERE upload_id = %s
+                    ORDER BY row_number ASC;
+                    """,
+                    (upload_id,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT row_number, data
+                    FROM upload_rows
+                    WHERE upload_id = %s
+                    ORDER BY row_number ASC
+                    LIMIT %s;
+                    """,
+                    (upload_id, limit),
+                )
+
+            return [
+                {"row_number": int(row_number), "data": data}
+                for row_number, data in cur.fetchall()
+            ]
