@@ -178,7 +178,8 @@ export default function App() {
     return dbAggregates.column_value_counts.slice(0, 12);
   }, [dbAggregates?.column_value_counts]);
 
-  const canUploadAgain = Platform.OS === "web" && (!upload || !!backendStats);
+  const hasLeftData = !!backendStats;
+  const titleStyle = hasLeftData ? [styles.title, styles.titleLeft] : styles.title;
 
   return (
     <SafeAreaView style={styles.screen}>
@@ -188,10 +189,10 @@ export default function App() {
         contentContainerStyle={styles.scrollContent}
         keyboardShouldPersistTaps="handled"
       >
-        <Text style={styles.title}>ReviewLens</Text>
+        <Text style={titleStyle}>ReviewLens</Text>
 
-        {Platform.OS === "web" && canUploadAgain ? (
-          <>
+        {Platform.OS === "web" && !hasLeftData ? (
+          <View style={styles.uploadCenterWrap}>
             <input
               type="file"
               accept=".csv,text/csv"
@@ -199,11 +200,11 @@ export default function App() {
               disabled={loading}
               style={fileInputStyle}
             />
-          </>
+          </View>
         ) : Platform.OS !== "web" ? (
           <Text style={styles.note}>
-            File upload is available in the web build only. Please open the app in
-            a browser.
+            File upload is available in the web build only. Please open the app in a
+            browser.
           </Text>
         ) : null}
 
@@ -211,55 +212,69 @@ export default function App() {
 
         {upload && (
           <View style={styles.dashboard}>
-            <View style={styles.panel}>
-              <Text style={styles.panelTitle}>Backend Aggregates</Text>
-              {loadingBackend && <Text style={styles.panelHint}>Loading…</Text>}
-              {backendStats && (
-                <View>
-                  <Text style={styles.kvLabel}>Rows</Text>
-                  <Text style={styles.kvValue}>{backendStats.rows}</Text>
-                  <Text style={styles.kvLabel}>Columns</Text>
-                  <Text style={styles.kvValue}>{backendStats.columns}</Text>
+            <View style={styles.leftColumn}>
+              <View style={styles.panel}>
+                <Text style={styles.panelTitle}>Backend Aggregates</Text>
+                {loadingBackend && <Text style={styles.panelHint}>Loading...</Text>}
+                {backendStats && (
+                  <View>
+                    <Text style={styles.kvLabel}>Rows</Text>
+                    <Text style={styles.kvValue}>{backendStats.rows}</Text>
+                    <Text style={styles.kvLabel}>Columns</Text>
+                    <Text style={styles.kvValue}>{backendStats.columns}</Text>
 
-                  <Text style={styles.sectionTitle}>Top Missing Columns</Text>
-                  {missingList.length === 0 ? (
-                    <Text style={styles.panelHint}>No missing-value stats.</Text>
-                  ) : (
-                    missingList.map(([col, count]) => (
-                      <Text key={col} style={styles.listItem}>
-                        {col}: {count}
-                      </Text>
-                    ))
-                  )}
-
-                  {backendStats.rating_category_counts?.length > 0 && (
-                    <>
-                      <Text style={styles.sectionTitle}>Rating Categories</Text>
-                      {backendStats.rating_category_counts.slice(0, 8).map((r) => (
-                        <Text key={r.category} style={styles.listItem}>
-                          {r.category}: {r.count}
+                    <Text style={styles.sectionTitle}>Top Missing Columns</Text>
+                    {missingList.length === 0 ? (
+                      <Text style={styles.panelHint}>No missing-value stats.</Text>
+                    ) : (
+                      missingList.map(([col, count]) => (
+                        <Text key={col} style={styles.listItem}>
+                          {col}: {count}
                         </Text>
-                      ))}
-                    </>
-                  )}
+                      ))
+                    )}
 
-                  {backendStats.rating_counts?.length > 0 && (
-                    <>
-                      <Text style={styles.sectionTitle}>Ratings</Text>
-                      {backendStats.rating_counts.slice(0, 8).map((r) => (
-                        <Text key={r.rating} style={styles.listItem}>
-                          {r.rating}: {r.count}
-                        </Text>
-                      ))}
-                    </>
-                  )}
+                    {backendStats.rating_category_counts?.length > 0 && (
+                      <>
+                        <Text style={styles.sectionTitle}>Rating Categories</Text>
+                        {backendStats.rating_category_counts.slice(0, 8).map((r) => (
+                          <Text key={r.category} style={styles.listItem}>
+                            {r.category}: {r.count}
+                          </Text>
+                        ))}
+                      </>
+                    )}
+
+                    {backendStats.rating_counts?.length > 0 && (
+                      <>
+                        <Text style={styles.sectionTitle}>Ratings</Text>
+                        {backendStats.rating_counts.slice(0, 8).map((r) => (
+                          <Text key={r.rating} style={styles.listItem}>
+                            {r.rating}: {r.count}
+                          </Text>
+                        ))}
+                      </>
+                    )}
+                  </View>
+                )}
+              </View>
+
+              {Platform.OS === "web" && hasLeftData && (
+                <View style={styles.uploadBelowLeft}>
+                  <input
+                    type="file"
+                    accept=".csv,text/csv"
+                    onChange={handleFileChange}
+                    disabled={loading}
+                    style={fileInputStyle}
+                  />
                 </View>
               )}
             </View>
 
             <View style={styles.panel}>
               <Text style={styles.panelTitle}>Database Aggregates</Text>
-              {loadingDb && <Text style={styles.panelHint}>Loading…</Text>}
+              {loadingDb && <Text style={styles.panelHint}>Loading...</Text>}
               {dbAggregates && (
                 <View>
                   <Text style={styles.kvLabel}>Rows in DB</Text>
@@ -318,22 +333,22 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   scrollContent: {
-    padding: 24,
+    paddingHorizontal: 16,
+    paddingTop: 16,
     paddingBottom: 48,
-    alignItems: "center",
+    alignItems: "stretch",
   },
   title: {
     fontSize: 28,
     fontWeight: "700",
-    marginTop: 32,
-    textAlign: "center",
-  },
-  subtitle: {
-    fontSize: 16,
-    color: "#4a4a4a",
-    textAlign: "center",
     marginTop: 12,
-    maxWidth: 420,
+    textAlign: "center",
+    alignSelf: "center",
+  },
+  titleLeft: {
+    textAlign: "left",
+    alignSelf: "flex-start",
+    marginTop: 4,
   },
   note: {
     marginTop: 16,
@@ -345,20 +360,28 @@ const styles = StyleSheet.create({
     marginTop: 8,
     color: "#d93025",
   },
-  dashboard: {
-    marginTop: 24,
+  uploadCenterWrap: {
     width: "100%",
-    maxWidth: 980,
+    alignItems: "center",
+    justifyContent: "center",
+    marginTop: 8,
+  },
+  dashboard: {
+    marginTop: 16,
+    width: "100%",
     flexDirection: "row",
     flexWrap: "wrap",
     gap: 16,
-    alignItems: "stretch",
+    alignItems: "flex-start",
     justifyContent: "space-between",
+  },
+  leftColumn: {
+    flex: 1,
+    minWidth: 280,
   },
   panel: {
     flex: 1,
     minWidth: 280,
-    maxWidth: 980,
     backgroundColor: "#fff",
     borderRadius: 16,
     padding: 18,
@@ -401,5 +424,9 @@ const styles = StyleSheet.create({
     marginTop: 6,
     fontSize: 14,
     color: "#111",
+  },
+  uploadBelowLeft: {
+    marginTop: 18,
+    alignItems: "flex-start",
   },
 });
