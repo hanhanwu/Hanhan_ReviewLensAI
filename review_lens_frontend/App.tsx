@@ -13,7 +13,7 @@ import {
   View,
 } from "react-native";
 
-const BACKEND_URL = "http://127.0.0.1:8000";
+const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL;
 const MAX_UPLOAD_BYTES = 250 * 1024;
 
 type UploadResponse = {
