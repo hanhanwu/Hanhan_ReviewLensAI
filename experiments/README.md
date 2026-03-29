@@ -20,6 +20,7 @@
 
 #### Test Local Website
 * Open terminal 1 and type `uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000` to start FastAPI server
+  * <b>Make sure the alignment of backend folder name here</b>
   * Backend console will show printed results
 * Open terminal 2, type `cd review_lens_frontend`
   * `npx expo start --web` will start the web 🚀
