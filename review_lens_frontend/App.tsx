@@ -133,22 +133,18 @@ export default function App() {
   const [chatScrollRef, setChatScrollRef] = useState<ScrollView | null>(null);
 
   const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
+    const inputElement = event.target;
+    const file = inputElement.files?.[0];
     if (!file) {
       return;
     }
 
     if (file.size > MAX_UPLOAD_BYTES) {
       window.alert("File size can't exceed 250 KB.");
-      event.target.value = "";
+      inputElement.value = "";
       return;
     }
 
-    setUpload(null);
-    setBackendStats(null);
-    setDbAggregates(null);
-    setChatMessages([]);
-    setChatInput("");
     setLoading(true);
     setError(null);
 
@@ -168,12 +164,14 @@ export default function App() {
       }
 
       const payload: UploadResponse = await response.json();
+      setChatMessages([]);
+      setChatInput("");
       setUpload(payload);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Upload failed.");
     } finally {
       setLoading(false);
-      event.target.value = "";
+      inputElement.value = "";
     }
   };
 
