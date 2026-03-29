@@ -25,7 +25,7 @@
 * Open terminal 2, type `cd review_lens_frontend`
   * `npx expo start --web` will start the web 🚀
 
-#### Railway Setup
+#### Railway Setup (backend)
 * Make sure there's a `requirements.txt` in your repo
 * Add `Variables`, in this case:
   * Add `GROQ_TOKEN`
@@ -42,6 +42,19 @@ Doesn't need to run your local code
   * Copy the generated domain to App.js as the value of BACKEND_URL, make sure you have `https://` before the URL!
 * In your terminal, type `npm install @expo/ngrok` to allow real device access to your local frontend
 * Under folder `review_lens_frontend/`, type `npx expo start --web -c`
+
+#### Cloudflare Setup (frontend)
+* Under folder "review_lens_frontend/"
+  * Run `npx expo export --platform web` to export web build, this should create a "dist" folder under this frontend folder
+  * In Cloudflare, search for `Worker & Pages` --> `Create New Application` --> Connect to github repo:
+    * Root directory: `review_lens_frontend`
+    * Framework preset: leave blank
+    * Build command: `npx expo export --platform web`
+    * Build output directory: `dist`
+    * Add variable `EXPO_PUBLIC_BACKEND_URL` and its value, same as what's saved in `review_lens_frontend/.env`
+    * "https://hanhan-reviewlensai.pages.dev" got generated
+  * `Workers & Pages` --> `hanhan-reviewlensai` --> `Custom domain` --> type `reviewlens.hanhanwu.com` and wait till it's active
+
 
 ## References
 #### Data Input
