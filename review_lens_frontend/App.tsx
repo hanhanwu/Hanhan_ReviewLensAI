@@ -51,23 +51,31 @@ type DbAggregates = {
 type ChatMessage = {
   role: "user" | "assistant";
   content: string;
+  memory?: Record<string, unknown>;
   agent?: string | null;
-  rewrittenQuestion?: string;
-  assumptions?: string[];
-  pythonCode?: string | null;
-  pythonResult?: Record<string, unknown> | null;
-  pythonLogs?: Array<Record<string, unknown>>;
+  chart?: ChartSpec | null;
 };
 
 type ChatResponse = {
   answer: string;
   model: string | null;
+  memory?: Record<string, unknown>;
   agent?: string | null;
-  rewritten_question?: string;
-  assumptions?: string[];
-  python_code?: string | null;
-  python_result?: Record<string, unknown> | null;
-  python_logs?: Array<Record<string, unknown>>;
+  chart?: ChartSpec | null;
+};
+
+type ChartDatum = {
+  label: string;
+  value: number;
+};
+
+type ChartSpec = {
+  type: "bar";
+  title: string;
+  description: string;
+  x_label: string;
+  y_label: string;
+  data: ChartDatum[];
 };
 
 const fileInputStyle: CSSProperties = {
@@ -246,7 +254,11 @@ export default function App() {
         },
         body: JSON.stringify({
           question,
-          history: chatMessages,
+          history: chatMessages.map((message) => ({
+            role: message.role,
+            content: message.content,
+            memory: message.memory,
+          })),
         }),
       });
 
@@ -265,12 +277,9 @@ export default function App() {
         {
           role: "assistant",
           content: payload.answer || "I don't know",
+          memory: payload.memory,
           agent: payload.agent ?? null,
-          rewrittenQuestion: payload.rewritten_question,
-          assumptions: payload.assumptions ?? [],
-          pythonCode: payload.python_code ?? null,
-          pythonResult: payload.python_result ?? null,
-          pythonLogs: payload.python_logs ?? [],
+          chart: payload.chart ?? null,
         },
       ]);
     } catch (err) {
@@ -290,6 +299,45 @@ export default function App() {
     if (event.nativeEvent.key === "Enter") {
       void sendChatMessage();
     }
+  };
+
+  const renderChart = (chart: ChartSpec | null | undefined) => {
+    if (!chart || chart.type !== "bar" || !Array.isArray(chart.data) || chart.data.length === 0) {
+      return null;
+    }
+
+    const maxValue = Math.max(...chart.data.map((item) => Number(item.value) || 0), 1);
+    const limitedData = chart.data.slice(0, 10);
+
+    return (
+      <View style={styles.chartCard}>
+        <Text style={styles.chartTitle}>{chart.title}</Text>
+        <Text style={styles.chartDescription}>{chart.description}</Text>
+        <View style={styles.chartArea}>
+          {limitedData.map((item) => (
+            <View key={item.label} style={styles.chartRow}>
+              <Text style={styles.chartLabel} numberOfLines={1}>
+                {item.label}
+              </Text>
+              <View style={styles.chartBarTrack}>
+                <View
+                  style={[
+                    styles.chartBarFill,
+                    {
+                      width: `${Math.max((Number(item.value) / maxValue) * 100, 4)}%`,
+                    },
+                  ]}
+                />
+              </View>
+              <Text style={styles.chartValue}>{String(item.value)}</Text>
+            </View>
+          ))}
+        </View>
+        <Text style={styles.chartAxis}>
+          {chart.x_label} vs {chart.y_label}
+        </Text>
+      </View>
+    );
   };
 
   return (
@@ -418,50 +466,7 @@ export default function App() {
                         {message.role === "user" ? "You" : "ReviewLens Bot"}
                       </Text>
                       <Text style={styles.chatText}>{message.content}</Text>
-                      {message.role === "assistant" && message.agent === "python" && (
-                        <View style={styles.debugPanel}>
-                          {message.rewrittenQuestion ? (
-                            <>
-                              <Text style={styles.debugLabel}>Rewritten Question</Text>
-                              <Text style={styles.debugText}>{message.rewrittenQuestion}</Text>
-                            </>
-                          ) : null}
-                          {message.assumptions && message.assumptions.length > 0 ? (
-                            <>
-                              <Text style={styles.debugLabel}>Assumptions</Text>
-                              <Text style={styles.debugText}>
-                                {message.assumptions.join(" | ")}
-                              </Text>
-                            </>
-                          ) : null}
-                          {message.pythonLogs && message.pythonLogs.length > 0 ? (
-                            <>
-                              <Text style={styles.debugLabel}>Python Agent Logs</Text>
-                              {message.pythonLogs.map((log, logIndex) => (
-                                <View key={`py-log-${logIndex}`} style={styles.debugLogEntry}>
-                                  <Text style={styles.debugText}>
-                                    Attempt {String(log.attempt ?? logIndex + 1)} -{" "}
-                                    {String(log.status ?? "unknown")}
-                                  </Text>
-                                  {"reason" in log && log.reason ? (
-                                    <Text style={styles.debugText}>
-                                      Reason: {String(log.reason)}
-                                    </Text>
-                                  ) : null}
-                                  {"code" in log && log.code ? (
-                                    <Text style={styles.debugCode}>{String(log.code)}</Text>
-                                  ) : null}
-                                  {"result" in log && log.result ? (
-                                    <Text style={styles.debugText}>
-                                      Result: {JSON.stringify(log.result)}
-                                    </Text>
-                                  ) : null}
-                                </View>
-                              ))}
-                            </>
-                          ) : null}
-                        </View>
-                      )}
+                      {message.role === "assistant" ? renderChart(message.chart) : null}
                     </View>
                   ))
                 )}
@@ -639,35 +644,56 @@ const styles = StyleSheet.create({
     lineHeight: 20,
     color: "#111",
   },
-  debugPanel: {
+  chartCard: {
     marginTop: 10,
     paddingTop: 10,
-    borderTopWidth: 1,
-    borderTopColor: "#d7dce3",
     gap: 6,
   },
-  debugLabel: {
-    fontSize: 11,
+  chartTitle: {
+    fontSize: 13,
     fontWeight: "700",
-    color: "#334155",
-    textTransform: "uppercase",
-  },
-  debugText: {
-    fontSize: 12,
-    lineHeight: 18,
-    color: "#334155",
-  },
-  debugCode: {
-    fontSize: 12,
-    lineHeight: 18,
     color: "#0f172a",
-    backgroundColor: "#e2e8f0",
-    borderRadius: 8,
-    padding: 8,
   },
-  debugLogEntry: {
-    gap: 4,
+  chartDescription: {
+    fontSize: 12,
+    lineHeight: 18,
+    color: "#475569",
+  },
+  chartArea: {
+    marginTop: 6,
+    gap: 8,
+  },
+  chartRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  chartLabel: {
+    fontSize: 12,
+    color: "#334155",
+    width: 84,
+  },
+  chartBarTrack: {
+    flex: 1,
+    height: 12,
+    borderRadius: 999,
+    backgroundColor: "#dbe7ff",
+  },
+  chartBarFill: {
+    height: "100%",
+    borderRadius: 999,
+    backgroundColor: "#2563eb",
+  },
+  chartValue: {
+    width: 42,
+    textAlign: "right",
+    fontSize: 12,
+    color: "#0f172a",
+  },
+  chartAxis: {
     marginTop: 4,
+    fontSize: 11,
+    color: "#64748b",
   },
   chatInputRow: {
     marginTop: 14,

@@ -103,6 +103,7 @@ SAFE_PYTHON_BUILTINS = {
 class ChatMessage(BaseModel):
     role: str
     content: str
+    memory: Dict[str, Any] | None = None
 
 
 class ChatRequest(BaseModel):
@@ -115,6 +116,7 @@ class AgentState(TypedDict, total=False):
     question: str
     history: List[ChatMessage]
     context: Dict[str, Any]
+    memory: Dict[str, Any]
     agent: Literal["sql", "python", "unknown"]
     rewritten_question: str
     assumptions: List[str]
@@ -125,6 +127,7 @@ class AgentState(TypedDict, total=False):
     python_code: str
     python_result: Dict[str, Any]
     python_logs: List[Dict[str, Any]]
+    chart: Dict[str, Any]
 
 
 def _require_groq_token() -> str:
@@ -192,6 +195,86 @@ def _trim_history(history: List[ChatMessage], *, max_messages: int = 8) -> List[
         if content:
             messages.append({"role": role, "content": content})
     return messages
+
+
+def _get_latest_memory(history: List[ChatMessage]) -> Dict[str, Any]:
+    for message in reversed(history):
+        if message.memory:
+            return dict(message.memory)
+    return {}
+
+
+def _resolve_followup_question(question: str, memory: Dict[str, Any]) -> str:
+    business_name = str(memory.get("last_business_name") or "").strip()
+    author_name = str(memory.get("last_author_name") or "").strip()
+    normalized_question = _normalize_text(question)
+    if not normalized_question:
+        return question
+
+    business_followup_markers = [
+        "it ",
+        "its ",
+        "that business",
+        "this business",
+        "that one",
+        "this one",
+        "for what",
+        "what about",
+        "mainly",
+    ]
+    author_followup_markers = [
+        "that author",
+        "this author",
+        "their ",
+        "that reviewer",
+        "this reviewer",
+    ]
+
+    if business_name and any(marker in f"{normalized_question} " for marker in business_followup_markers):
+        return f'For the business "{business_name}", {question.strip()}'
+
+    if author_name and any(marker in f"{normalized_question} " for marker in author_followup_markers):
+        return f'For the author "{author_name}", {question.strip()}'
+
+    return question
+
+
+def _extract_turn_memory(
+    *,
+    agent: str,
+    rewritten_question: str,
+    answer: str,
+    sql_rows: List[Dict[str, Any]] | None = None,
+    python_result: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    memory: Dict[str, Any] = {
+        "last_agent": agent,
+        "last_rewritten_question": rewritten_question,
+        "last_answer": answer,
+    }
+
+    rows = sql_rows or []
+    if rows:
+        first_row = rows[0]
+        for key in ("business_name", "business", "name"):
+            value = first_row.get(key)
+            if isinstance(value, str) and value.strip():
+                memory["last_business_name"] = value.strip()
+                break
+        for key in ("author_name", "author", "reviewer_name"):
+            value = first_row.get(key)
+            if isinstance(value, str) and value.strip():
+                memory["last_author_name"] = value.strip()
+                break
+
+    if python_result and isinstance(python_result.get("result"), dict):
+        result_dict = python_result["result"]
+        if isinstance(result_dict.get("business_name"), str):
+            memory["last_business_name"] = result_dict["business_name"].strip()
+        if isinstance(result_dict.get("author_name"), str):
+            memory["last_author_name"] = result_dict["author_name"].strip()
+
+    return memory
 
 
 def _build_chat_context(upload_id: uuid.UUID) -> Dict[str, Any]:
@@ -394,10 +477,12 @@ def _get_commander_decision(
                 "Understand the user's intent flexibly and semantically, even if they do not use exact column names or exact dataset wording. "
                 "Map natural language phrases to the closest relevant dataset concepts when reasonable. "
                 "For example, pluralization, possessives, paraphrases, and rough business-language references should still be understood when they clearly refer to the dataset. "
+                "Use the provided conversation memory to resolve follow-up references such as it, its, that business, that author, that one, or omitted subjects. "
                 "Rewrite the question with the correct assumptions and relevant details from the dataset. "
                 "Choose exactly one route: sql or python. "
                 "Choose sql for straightforward counting, filtering, grouping, sorting, and aggregation that can be answered directly in SQL. "
                 "Choose python for questions that need more flexible dataframe logic, derived calculations, or operations that are easier in pandas. "
+                "Always choose python for requests that ask to draw, plot, chart, graph, or visualize data. "
                 "Unless the question is clearly unrelated to the dataset, you must choose either sql or python. "
                 "If there is any reasonable chance SQL can answer it, prefer sql. "
                 "Do not refuse just because the wording is imperfect or the requested concept needs interpretation. "
@@ -648,12 +733,20 @@ def _run_python_code(code: str, df: pd.DataFrame) -> Dict[str, Any]:
         return {"ok": False, "error": f"Python worker execution failed: {exc}"}
 
     result = locals_dict.get("result")
-    if result is None and "result" not in locals_dict:
+    chart = locals_dict.get("chart")
+    if result is None and "result" not in locals_dict and chart is None:
         return {"ok": False, "error": "Python worker did not set result."}
+
+    if result is None and chart is not None:
+        if isinstance(chart, dict):
+            result = chart.get("description") or chart.get("title") or "Chart generated."
+        else:
+            result = "Chart generated."
 
     return {
         "ok": True,
         "result": _json_compatible(result),
+        "chart": _json_compatible(chart) if chart is not None else None,
         "stdout": stdout_buffer.getvalue().strip(),
     }
 
@@ -681,8 +774,12 @@ def _run_python_worker(
                     "role": "system",
                     "content": (
                         "You are a Python dataframe code writer for dataset QA. "
-                        "Write Python code using the pandas DataFrame variable df to answer the user's rewritten question. "
-                        "Set a variable named result to the final answer object. "
+                    "Write Python code using the pandas DataFrame variable df to answer the user's rewritten question. "
+                    "Always set a variable named result to a brief user-facing answer object or sentence. "
+                    "If the user is asking for a chart, graph, plot, or visualization, also set a variable named chart. "
+                    "The chart must be a dict with this exact shape: "
+                    "{'type': 'bar', 'title': str, 'description': str, 'x_label': str, 'y_label': str, 'data': [{'label': str, 'value': number}]}. "
+                    "Keep chart data concise, preferably 10 bars or fewer. "
                         "Use normal pandas syntax and keep the code concise and correct. "
                         "Do not import anything. Do not access files, network, subprocesses, or system resources. "
                         "Do not call tools. Do not return a function call. "
@@ -756,6 +853,7 @@ def _run_python_worker(
                 "python_code": code,
                 "python_result": execution_result,
                 "python_logs": python_logs,
+                "chart": execution_result.get("chart"),
             }
 
         return {
@@ -834,6 +932,10 @@ def _startup() -> None:
 def _json_compatible(value: Any) -> Any:
     if value is None:
         return None
+    if isinstance(value, dict):
+        return {str(k): _json_compatible(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_compatible(v) for v in value]
     if isinstance(value, float):
         if math.isnan(value) or math.isinf(value):
             return None
@@ -1055,25 +1157,37 @@ def upload_chat(upload_id: uuid.UUID, request: ChatRequest):
         logger.info("Chat rejected before commander | question=%r | reason=obviously_irrelevant", question)
         return {"answer": UNKNOWN_ANSWER, "model": None, "agent": "unknown"}
 
+    latest_memory = _get_latest_memory(request.history)
+    resolved_question = _resolve_followup_question(question, latest_memory)
+    context["conversation_memory"] = latest_memory
+
     try:
         result = CHATBOT_GRAPH.invoke(
             {
                 "upload_id": upload_id,
-                "question": question,
+                "question": resolved_question,
                 "history": request.history,
                 "context": context,
+                "memory": latest_memory,
             }
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
+    turn_memory = _extract_turn_memory(
+        agent=str(result.get("agent", "unknown")),
+        rewritten_question=str(result.get("rewritten_question", resolved_question)),
+        answer=_normalize_unknown_answer(result.get("answer", UNKNOWN_ANSWER)),
+        sql_rows=result.get("sql_rows"),
+        python_result=result.get("python_result"),
+    )
+
     return {
         "answer": _normalize_unknown_answer(result.get("answer", UNKNOWN_ANSWER)),
         "model": GROQ_MODEL,
         "agent": result.get("agent", "unknown"),
-        "rewritten_question": result.get("rewritten_question", question),
+        "rewritten_question": result.get("rewritten_question", resolved_question),
         "assumptions": result.get("assumptions", []),
-        "python_code": result.get("python_code"),
-        "python_result": result.get("python_result"),
-        "python_logs": result.get("python_logs", []),
+        "chart": result.get("chart"),
+        "memory": turn_memory,
     }
