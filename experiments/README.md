@@ -24,6 +24,23 @@
 * Open terminal 2, type `cd review_lens_frontend`
   * `npx expo start --web` will start the web 🚀
 
+#### Railway Setup
+* Make sure there's a `requirements.txt` in your repo
+* Add `Variables`, in this case:
+  * Add `GROQ_TOKEN`
+  * Add `NERO_DB_URL`
+* Create `start.sh` and use default Railpack for build
+  * <b>make sure the alignment of the backend folder name here</b>
+  * Click your Service --> Click `Settings`
+  * Scroll down to `Start Command` --> enter `bash start.sh`
+* After a successful deployment, click the `Service` --> Click `Settings`
+* Under `Networking` --> Click `Generate Domain` --> port number can be 8080
+  * You can test https://{Railway URL}/docs from browser, if it shows FastAPI page, then you're good
+Doesn't need to run your local code
+  * If you have multiple Railway projects, their domain can all be 8080, as long as they're separated deployments, cuz in Railway each project has its own container
+  * Copy the generated domain to App.js as the value of BACKEND_URL, make sure you have `https://` before the URL!
+* In your terminal, type `npm install @expo/ngrok` to allow real device access to your local frontend
+* Under folder `review_lens_frontend/`, type `npx expo start --web -c`
 
 ## References
 #### Data Input

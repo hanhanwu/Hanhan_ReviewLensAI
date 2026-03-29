@@ -90,6 +90,35 @@ const fileInputStyle: CSSProperties = {
   backgroundColor: "#fff",
 };
 
+const getConfiguredBackendUrl = () => {
+  const value = BACKEND_URL?.trim();
+  if (!value) {
+    throw new Error(
+      "Missing EXPO_PUBLIC_BACKEND_URL. Add it to review_lens_frontend/.env and restart Expo."
+    );
+  }
+  return value.replace(/\/+$/, "");
+};
+
+const readErrorDetail = async (response: Response, fallback: string) => {
+  const contentType = response.headers.get("content-type") || "";
+
+  if (contentType.includes("application/json")) {
+    const payload = await response.json().catch(() => null);
+    if (payload && typeof payload.detail === "string") {
+      return payload.detail;
+    }
+    return fallback;
+  }
+
+  const rawText = await response.text().catch(() => "");
+  if (rawText.trim().startsWith("<!DOCTYPE") || rawText.trim().startsWith("<html")) {
+    return `${fallback} The server returned HTML instead of JSON. Check EXPO_PUBLIC_BACKEND_URL and your deployed API route.`;
+  }
+
+  return rawText.trim() || fallback;
+};
+
 export default function App() {
   const [upload, setUpload] = useState<UploadResponse | null>(null);
   const [backendStats, setBackendStats] = useState<BackendStats | null>(null);
@@ -124,20 +153,17 @@ export default function App() {
     setError(null);
 
     try {
+      const backendUrl = getConfiguredBackendUrl();
       const formData = new FormData();
       formData.append("file", file);
 
-      const response = await fetch(`${BACKEND_URL}/upload`, {
+      const response = await fetch(`${backendUrl}/upload`, {
         method: "POST",
         body: formData,
       });
 
       if (!response.ok) {
-        const payload = await response.json().catch(() => null);
-        const detail =
-          payload && typeof payload.detail === "string"
-            ? payload.detail
-            : "Unable to upload the file.";
+        const detail = await readErrorDetail(response, "Unable to upload the file.");
         throw new Error(detail);
       }
 
@@ -157,20 +183,25 @@ export default function App() {
     }
 
     let cancelled = false;
+    let backendUrl: string;
+
+    try {
+      backendUrl = getConfiguredBackendUrl();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Backend URL is not configured.");
+      return;
+    }
+
     setLoadingBackend(true);
     setLoadingDb(true);
     setBackendStats(null);
     setDbAggregates(null);
     setError(null);
 
-    fetch(`${BACKEND_URL}/uploads/${upload.upload_id}/backend-stats`)
+    fetch(`${backendUrl}/uploads/${upload.upload_id}/backend-stats`)
       .then(async (r) => {
         if (!r.ok) {
-          const payload = await r.json().catch(() => null);
-          const detail =
-            payload && typeof payload.detail === "string"
-              ? payload.detail
-              : "Failed to load backend stats.";
+          const detail = await readErrorDetail(r, "Failed to load backend stats.");
           throw new Error(detail);
         }
         return (await r.json()) as BackendStats;
@@ -188,14 +219,10 @@ export default function App() {
         setLoadingBackend(false);
       });
 
-    fetch(`${BACKEND_URL}/uploads/${upload.upload_id}/db-aggregates`)
+    fetch(`${backendUrl}/uploads/${upload.upload_id}/db-aggregates`)
       .then(async (r) => {
         if (!r.ok) {
-          const payload = await r.json().catch(() => null);
-          const detail =
-            payload && typeof payload.detail === "string"
-              ? payload.detail
-              : "Failed to load database aggregates.";
+          const detail = await readErrorDetail(r, "Failed to load database aggregates.");
           throw new Error(detail);
         }
         return (await r.json()) as DbAggregates;
@@ -247,7 +274,8 @@ export default function App() {
     setError(null);
 
     try {
-      const response = await fetch(`${BACKEND_URL}/uploads/${upload.upload_id}/chat`, {
+      const backendUrl = getConfiguredBackendUrl();
+      const response = await fetch(`${backendUrl}/uploads/${upload.upload_id}/chat`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -263,11 +291,7 @@ export default function App() {
       });
 
       if (!response.ok) {
-        const payload = await response.json().catch(() => null);
-        const detail =
-          payload && typeof payload.detail === "string"
-            ? payload.detail
-            : "Failed to get chatbot response.";
+        const detail = await readErrorDetail(response, "Failed to get chatbot response.");
         throw new Error(detail);
       }
 
