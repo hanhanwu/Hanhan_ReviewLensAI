@@ -1,17 +1,19 @@
-import io
-import uuid
-from io import BytesIO
 import json
+import io
+import logging
 import math
 import os
+import uuid
 from contextlib import redirect_stdout
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Tuple
+from io import BytesIO
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Literal, Tuple, TypedDict
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import pandas as pd
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
 from backend.db import (
@@ -32,9 +34,12 @@ app = FastAPI(
     description="Upload a CSV and report how many rows and columns it contains.",
 )
 
+logger = logging.getLogger("reviewlens.chat")
+
 GROQ_MODEL = "openai/gpt-oss-safeguard-20b"
 UNKNOWN_ANSWER = "I don't know"
 MAX_SQL_RESULT_ROWS = 200
+MAX_WORKER_RETRIES = 3
 DATA_ANALYSIS_TERMS = {
     "average",
     "column",
@@ -104,11 +109,38 @@ class ChatRequest(BaseModel):
     history: List[ChatMessage] = []
 
 
+class AgentState(TypedDict, total=False):
+    upload_id: uuid.UUID
+    question: str
+    history: List[ChatMessage]
+    context: Dict[str, Any]
+    agent: Literal["sql", "python", "unknown"]
+    rewritten_question: str
+    assumptions: List[str]
+    answer: str
+    sql: str
+    sql_columns: List[str]
+    sql_rows: List[Dict[str, Any]]
+    python_code: str
+    python_result: Dict[str, Any]
+
+
 def _require_groq_token() -> str:
     token = os.getenv("GROQ_TOKEN")
     if not token:
         raise RuntimeError('Missing environment variable "GROQ_TOKEN".')
     return token
+
+
+def _response_format_json_schema(name: str, schema: Dict[str, Any], *, strict: bool = False) -> Dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": name,
+            "strict": strict,
+            "schema": schema,
+        },
+    }
 
 
 def _normalize_text(value: str) -> str:
@@ -129,6 +161,26 @@ def _question_appears_data_related(question: str, column_names: List[str]) -> bo
     return any(column and column in normalized_question for column in normalized_columns)
 
 
+def _question_is_obviously_irrelevant(question: str) -> bool:
+    normalized_question = _normalize_text(question)
+    if not normalized_question:
+        return True
+
+    unrelated_terms = [
+        "weather",
+        "president",
+        "capital of",
+        "movie",
+        "recipe",
+        "song",
+        "celebrity",
+        "football score",
+        "stock price",
+        "bitcoin",
+    ]
+    return any(term in normalized_question for term in unrelated_terms)
+
+
 def _trim_history(history: List[ChatMessage], *, max_messages: int = 8) -> List[dict[str, str]]:
     trimmed = history[-max_messages:]
     messages: List[dict[str, str]] = []
@@ -146,13 +198,21 @@ def _build_chat_context(upload_id: uuid.UUID) -> Dict[str, Any]:
     return context
 
 
-def _call_groq_messages(messages: List[dict[str, str]], *, temperature: float = 0.1) -> str:
+def _call_groq_messages(
+    messages: List[dict[str, str]],
+    *,
+    temperature: float = 0.1,
+    response_format: Dict[str, Any] | None = None,
+) -> str:
     token = _require_groq_token()
     payload = {
         "model": GROQ_MODEL,
         "temperature": temperature,
         "messages": messages,
+        "tool_choice": "none",
     }
+    if response_format is not None:
+        payload["response_format"] = response_format
 
     request = Request(
         "https://api.groq.com/openai/v1/chat/completions",
@@ -171,6 +231,22 @@ def _call_groq_messages(messages: List[dict[str, str]], *, temperature: float = 
             raw = response.read().decode("utf-8")
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="ignore")
+        try:
+            parsed = json.loads(detail)
+            failed_generation = (
+                parsed.get("error", {}).get("failed_generation")
+                if isinstance(parsed, dict)
+                else None
+            )
+            if isinstance(failed_generation, str):
+                try:
+                    fg_json = json.loads(failed_generation)
+                    if isinstance(fg_json, dict) and isinstance(fg_json.get("arguments"), dict):
+                        return json.dumps(fg_json["arguments"])
+                except Exception:
+                    pass
+        except Exception:
+            pass
         raise RuntimeError(f"Groq API request failed with status {exc.code}: {detail}")
     except URLError as exc:
         raise RuntimeError(f"Unable to reach Groq API: {exc.reason}")
@@ -211,6 +287,99 @@ def _normalize_unknown_answer(answer: str) -> str:
     return answer.strip() or UNKNOWN_ANSWER
 
 
+COMMANDER_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "rewritten_question": {"type": "string"},
+        "agent": {"type": "string", "enum": ["sql", "python"]},
+        "assumptions": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+    "required": ["rewritten_question", "agent", "assumptions"],
+    "additionalProperties": False,
+}
+
+SQL_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query_text": {"type": "string"},
+        "notes": {"type": "string"},
+    },
+    "required": ["query_text", "notes"],
+    "additionalProperties": False,
+}
+
+
+def _format_scalar(value: Any) -> str:
+    normalized = _json_compatible(value)
+    if normalized is None:
+        return "null"
+    return str(normalized)
+
+
+def _format_sql_answer(rewritten_question: str, columns: List[str], rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return UNKNOWN_ANSWER
+    if len(rows) == 1 and len(columns) == 1:
+        return f"{columns[0]}: {_format_scalar(rows[0].get(columns[0]))}"
+    if len(rows) == 1:
+        parts = [f"{column}: {_format_scalar(rows[0].get(column))}" for column in columns]
+        return "; ".join(parts)
+
+    preview = rows[:5]
+    formatted_rows = []
+    for row in preview:
+        formatted_rows.append(
+            ", ".join(f"{column}={_format_scalar(row.get(column))}" for column in columns)
+        )
+    return "\n".join(formatted_rows)
+
+
+def _format_python_answer(execution_result: Dict[str, Any]) -> str:
+    if not execution_result.get("ok"):
+        return UNKNOWN_ANSWER
+
+    result = execution_result.get("result")
+    stdout = execution_result.get("stdout")
+    if isinstance(result, list):
+        if not result:
+            return UNKNOWN_ANSWER
+        preview = result[:5]
+        return "\n".join(_format_scalar(item) for item in preview)
+    if isinstance(result, dict):
+        if not result:
+            return UNKNOWN_ANSWER
+        return "; ".join(f"{key}: {_format_scalar(value)}" for key, value in result.items())
+    if result is not None:
+        return _format_scalar(result)
+    if stdout:
+        return stdout
+    return UNKNOWN_ANSWER
+
+
+def _build_retry_user_prompt(
+    *,
+    rewritten_question: str,
+    attempt: int,
+    failure_reason: str | None,
+    previous_output: str | None,
+) -> str:
+    if attempt == 1:
+        return rewritten_question
+
+    lines = [
+        f"Original meaning to preserve exactly: {rewritten_question}",
+        "Rewrite the request internally in clearer technical terms without changing its meaning, then try again.",
+    ]
+    if failure_reason:
+        lines.append(f"Previous attempt failed because: {failure_reason}")
+    if previous_output:
+        lines.append(f"Previous generated output: {previous_output}")
+    return "\n".join(lines)
+
+
 def _get_commander_decision(
     *, question: str, history: List[ChatMessage], context: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -218,13 +387,18 @@ def _get_commander_decision(
         {
             "role": "system",
             "content": (
-                "You are the commander agent for a dataset QA system. "
+                "You are the commander for a dataset QA system. "
                 "You receive a user question, the dataset schema, aggregates, and example rows. "
+                "Understand the user's intent flexibly and semantically, even if they do not use exact column names or exact dataset wording. "
+                "Map natural language phrases to the closest relevant dataset concepts when reasonable. "
+                "For example, pluralization, possessives, paraphrases, and rough business-language references should still be understood when they clearly refer to the dataset. "
                 "Rewrite the question with the correct assumptions and relevant details from the dataset. "
-                "Choose exactly one worker: sql, python, or unknown. "
+                "Choose exactly one route: sql or python. "
                 "Choose sql for straightforward counting, filtering, grouping, sorting, and aggregation that can be answered directly in SQL. "
                 "Choose python for questions that need more flexible dataframe logic, derived calculations, or operations that are easier in pandas. "
-                f"Choose unknown if the question is unrelated to the dataset or cannot be answered from the provided data. "
+                "Unless the question is clearly unrelated to the dataset, you must choose either sql or python. "
+                "If there is any reasonable chance SQL can answer it, prefer sql. "
+                "Do not refuse just because the wording is imperfect or the requested concept needs interpretation. "
                 "Return strict JSON with keys: rewritten_question, agent, assumptions."
             ),
         },
@@ -235,11 +409,19 @@ def _get_commander_decision(
         *_trim_history(history),
         {"role": "user", "content": question.strip()},
     ]
-    raw = _call_groq_messages(messages, temperature=0.0)
+    raw = _call_groq_messages(
+        messages,
+        temperature=0.0,
+        response_format=_response_format_json_schema(
+            "commander_decision",
+            COMMANDER_RESPONSE_SCHEMA,
+            strict=False,
+        ),
+    )
     decision = _extract_json_object(raw)
-    agent = str(decision.get("agent", "unknown")).strip().lower()
-    if agent not in {"sql", "python", "unknown"}:
-        agent = "unknown"
+    agent = str(decision.get("agent", "sql")).strip().lower()
+    if agent not in {"sql", "python"}:
+        agent = "sql"
     rewritten_question = str(decision.get("rewritten_question", question)).strip() or question
     assumptions = decision.get("assumptions", [])
     if not isinstance(assumptions, list):
@@ -251,99 +433,167 @@ def _get_commander_decision(
     }
 
 
-def _is_safe_sql(sql_text: str) -> bool:
+def _commander_node(state: AgentState) -> AgentState:
+    try:
+        decision = _get_commander_decision(
+            question=state["question"],
+            history=state.get("history", []),
+            context=state["context"],
+        )
+    except Exception as exc:
+        logger.warning(
+            "Commander failed, defaulting to SQL | question=%r | error=%s",
+            state["question"],
+            exc,
+        )
+        decision = {
+            "agent": "sql",
+            "rewritten_question": state["question"],
+            "assumptions": [],
+        }
+    logger.info(
+        "Commander decision | question=%r | rewritten=%r | agent=%s | assumptions=%s",
+        state["question"],
+        decision["rewritten_question"],
+        decision["agent"],
+        decision["assumptions"],
+    )
+    return {
+        "agent": decision["agent"],
+        "rewritten_question": decision["rewritten_question"],
+        "assumptions": decision["assumptions"],
+    }
+
+
+def _validate_sql(sql_text: str) -> tuple[bool, str]:
     normalized = _normalize_text(sql_text)
     if not normalized:
-        return False
+        return False, "empty_sql"
     if ";" in sql_text.strip().rstrip(";"):
-        return False
+        return False, "multiple_statements"
     if not (normalized.startswith("select") or normalized.startswith("with")):
-        return False
+        return False, "not_select_or_with"
     blocked = ["insert ", "update ", "delete ", "drop ", "alter ", "truncate ", "create "]
     if any(token in normalized for token in blocked):
-        return False
+        return False, "mutation_keyword"
     if " upload_rows" in normalized or " uploads" in normalized:
-        return False
-    return True
+        return False, "references_base_tables_instead_of_ctes"
+    return True, "ok"
 
 
-def _run_sql_worker(*, upload_id: uuid.UUID, rewritten_question: str, context: Dict[str, Any]) -> str:
-    sql_generation_messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are the SQL worker agent for dataset QA. "
-                "Write one read-only PostgreSQL query that answers the user's rewritten question. "
-                "You may only query these two CTEs, which will already exist when your query runs: "
-                "current_upload_rows(row_number, data) and current_upload_meta(upload_id, filename, created_at, rows_count, columns_count, column_names, backend_stats). "
-                "Each row in current_upload_rows has a JSONB column named data. "
-                "Return strict JSON with keys: sql and notes. "
-                "The sql must be a single SELECT or WITH query only."
+def _run_sql_worker(
+    *, upload_id: uuid.UUID, rewritten_question: str, context: Dict[str, Any]
+) -> Dict[str, Any]:
+    last_sql = ""
+    last_failure_reason: str | None = None
+
+    for attempt in range(1, MAX_WORKER_RETRIES + 1):
+        sql_generation_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a PostgreSQL query writer for dataset QA. "
+                    "The database is NERO Serverless Postgres, so write valid PostgreSQL syntax compatible with NERO Serverless Postgres. "
+                    "Write one read-only PostgreSQL query that answers the user's rewritten question. "
+                    "You may only query these two CTEs, which will already exist when your query runs: "
+                    "current_upload_rows(row_number, data) and current_upload_meta(upload_id, filename, created_at, rows_count, columns_count, column_names, backend_stats). "
+                    "Each row in current_upload_rows has a JSONB column named data. "
+                    "Use PostgreSQL JSONB syntax such as data->>'column_name' for text extraction when needed. "
+                    "Prefer straightforward GROUP BY, COUNT, ORDER BY, FILTER, and CAST syntax that NERO/Postgres supports. "
+                    "Return strict JSON with keys: query_text and notes. "
+                    "Do not call tools. Do not return a function call. "
+                    "The query_text value must be a single syntactically correct SELECT or WITH query only."
+                ),
+            },
+            {
+                "role": "system",
+                "content": f"Dataset context:\n{json.dumps(context, ensure_ascii=True)}",
+            },
+            {
+                "role": "user",
+                "content": _build_retry_user_prompt(
+                    rewritten_question=rewritten_question,
+                    attempt=attempt,
+                    failure_reason=last_failure_reason,
+                    previous_output=last_sql or None,
+                ),
+            },
+        ]
+        sql_raw = _call_groq_messages(
+            sql_generation_messages,
+            temperature=0.0,
+            response_format=_response_format_json_schema(
+                "sql_query_generation",
+                SQL_RESPONSE_SCHEMA,
+                strict=False,
             ),
-        },
-        {
-            "role": "system",
-            "content": f"Dataset context:\n{json.dumps(context, ensure_ascii=True)}",
-        },
-        {"role": "user", "content": rewritten_question},
-    ]
-    sql_raw = _call_groq_messages(sql_generation_messages, temperature=0.0)
-    sql_plan = _extract_json_object(sql_raw)
-    sql_text = str(sql_plan.get("sql", "")).strip()
-    if not _is_safe_sql(sql_text):
-        return UNKNOWN_ANSWER
-
-    wrapped_sql = f"""
-        WITH current_upload_rows AS (
-          SELECT row_number, data
-          FROM upload_rows
-          WHERE upload_id = %s
-        ),
-        current_upload_meta AS (
-          SELECT upload_id, filename, created_at, rows_count, columns_count, column_names, backend_stats
-          FROM uploads
-          WHERE upload_id = %s
         )
-        {sql_text}
-    """
+        sql_plan = _extract_json_object(sql_raw)
+        sql_text = str(sql_plan.get("query_text", "")).strip()
+        last_sql = sql_text
+        is_valid_sql, sql_rejection_reason = _validate_sql(sql_text)
+        logger.info(
+            "SQL worker generated query | attempt=%s | rewritten=%r | sql=%r | valid=%s | reason=%s",
+            attempt,
+            rewritten_question,
+            sql_text,
+            is_valid_sql,
+            sql_rejection_reason,
+        )
+        if not is_valid_sql:
+            last_failure_reason = sql_rejection_reason
+            continue
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(wrapped_sql, (upload_id, upload_id))
-            rows = cur.fetchmany(MAX_SQL_RESULT_ROWS)
-            columns = [desc[0] for desc in cur.description] if cur.description else []
-
-    result_rows = [
-        {columns[i]: _json_compatible(value) for i, value in enumerate(row)}
-        for row in rows
-    ]
-
-    answer_messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are the SQL worker agent finishing a dataset answer. "
-                "Answer only from the SQL result and the dataset context. "
-                f"If the result does not support a grounded answer, reply with exactly: {UNKNOWN_ANSWER}. "
-                "Keep the answer concise."
+        wrapped_sql = f"""
+            WITH current_upload_rows AS (
+              SELECT row_number, data
+              FROM upload_rows
+              WHERE upload_id = %s
             ),
-        },
-        {
-            "role": "system",
-            "content": json.dumps(
-                {
-                    "rewritten_question": rewritten_question,
-                    "sql": sql_text,
-                    "result_columns": columns,
-                    "result_rows": result_rows,
-                    "row_count": len(result_rows),
-                },
-                ensure_ascii=True,
+            current_upload_meta AS (
+              SELECT upload_id, filename, created_at, rows_count, columns_count, column_names, backend_stats
+              FROM uploads
+              WHERE upload_id = %s
+            )
+            {sql_text}
+        """
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(wrapped_sql, (upload_id, upload_id))
+                    rows = cur.fetchmany(MAX_SQL_RESULT_ROWS)
+                    columns = [desc[0] for desc in cur.description] if cur.description else []
+        except Exception as exc:
+            last_failure_reason = f"sql_execution_error: {exc}"
+            logger.warning(
+                "SQL worker execution failed | attempt=%s | rewritten=%r | sql=%r | error=%s",
+                attempt,
+                rewritten_question,
+                sql_text,
+                exc,
+            )
+            continue
+
+        result_rows = [
+            {columns[i]: _json_compatible(value) for i, value in enumerate(row)}
+            for row in rows
+        ]
+        return {
+            "answer": _normalize_unknown_answer(
+                _format_sql_answer(rewritten_question, columns, result_rows)
             ),
-        },
-        {"role": "user", "content": rewritten_question},
-    ]
-    return _normalize_unknown_answer(_call_groq_messages(answer_messages, temperature=0.0))
+            "sql": sql_text,
+            "sql_columns": columns,
+            "sql_rows": result_rows,
+        }
+
+    return {
+        "answer": UNKNOWN_ANSWER,
+        "sql": last_sql,
+        "sql_columns": [],
+        "sql_rows": [],
+    }
 
 
 def _extract_python_code(text: str) -> str:
@@ -359,6 +609,27 @@ def _extract_python_code(text: str) -> str:
     return cleaned
 
 
+def _is_safe_python_code(code: str) -> bool:
+    normalized = _normalize_text(code)
+    blocked_tokens = [
+        "__import__",
+        "import ",
+        "open(",
+        "exec(",
+        "eval(",
+        "compile(",
+        "globals(",
+        "locals(",
+        "os.",
+        "sys.",
+        "subprocess",
+        "socket",
+        "pathlib",
+        "shutil",
+    ]
+    return not any(token in normalized for token in blocked_tokens)
+
+
 def _run_python_code(code: str, df: pd.DataFrame) -> Dict[str, Any]:
     stdout_buffer = io.StringIO()
     globals_dict = {
@@ -371,8 +642,8 @@ def _run_python_code(code: str, df: pd.DataFrame) -> Dict[str, Any]:
     try:
         with redirect_stdout(stdout_buffer):
             exec(code, globals_dict, locals_dict)
-    except Exception:
-        return {"ok": False, "error": "Python worker execution failed."}
+    except Exception as exc:
+        return {"ok": False, "error": f"Python worker execution failed: {exc}"}
 
     result = locals_dict.get("result")
     if result is None and "result" not in locals_dict:
@@ -387,7 +658,7 @@ def _run_python_code(code: str, df: pd.DataFrame) -> Dict[str, Any]:
 
 def _run_python_worker(
     *, upload_id: uuid.UUID, rewritten_question: str, context: Dict[str, Any]
-) -> str:
+) -> Dict[str, Any]:
     rows = get_upload_rows(upload_id)
     dataframe_rows = []
     for item in rows:
@@ -396,53 +667,134 @@ def _run_python_worker(
         dataframe_rows.append(row)
     df = pd.DataFrame(dataframe_rows)
 
-    code_generation_messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are the Python worker agent for dataset QA. "
-                "Write Python code using the pandas DataFrame variable df to answer the user's rewritten question. "
-                "Set a variable named result to the final answer object. "
-                "Do not import anything. Do not access files, network, subprocesses, or system resources. "
-                "Return only Python code."
-            ),
-        },
-        {
-            "role": "system",
-            "content": f"Dataset context:\n{json.dumps(context, ensure_ascii=True)}",
-        },
-        {"role": "user", "content": rewritten_question},
-    ]
-    code_raw = _call_groq_messages(code_generation_messages, temperature=0.0)
-    code = _extract_python_code(code_raw)
-    execution_result = _run_python_code(code, df)
-    if not execution_result.get("ok"):
-        return UNKNOWN_ANSWER
+    last_code = ""
+    last_failure_reason: str | None = None
 
-    answer_messages = [
+    for attempt in range(1, MAX_WORKER_RETRIES + 1):
+        code_generation_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a Python dataframe code writer for dataset QA. "
+                    "Write Python code using the pandas DataFrame variable df to answer the user's rewritten question. "
+                    "Set a variable named result to the final answer object. "
+                    "Use normal pandas syntax and keep the code concise and correct. "
+                    "Do not import anything. Do not access files, network, subprocesses, or system resources. "
+                    "Do not call tools. Do not return a function call. "
+                    "Return only Python code."
+                ),
+            },
+            {
+                "role": "system",
+                "content": f"Dataset context:\n{json.dumps(context, ensure_ascii=True)}",
+            },
+            {
+                "role": "user",
+                "content": _build_retry_user_prompt(
+                    rewritten_question=rewritten_question,
+                    attempt=attempt,
+                    failure_reason=last_failure_reason,
+                    previous_output=last_code or None,
+                ),
+            },
+        ]
+        code_raw = _call_groq_messages(code_generation_messages, temperature=0.0)
+        code = _extract_python_code(code_raw)
+        last_code = code
+        logger.info(
+            "Python worker generated code | attempt=%s | rewritten=%r | code=%r",
+            attempt,
+            rewritten_question,
+            code,
+        )
+        if not _is_safe_python_code(code):
+            last_failure_reason = "unsafe_code"
+            logger.warning(
+                "Python worker rejected code | attempt=%s | rewritten=%r | reason=unsafe_code",
+                attempt,
+                rewritten_question,
+            )
+            continue
+
+        execution_result = _run_python_code(code, df)
+        if not execution_result.get("ok"):
+            last_failure_reason = str(execution_result.get("error", "execution_failed"))
+            logger.warning(
+                "Python worker execution failed | attempt=%s | rewritten=%r | error=%s",
+                attempt,
+                rewritten_question,
+                execution_result.get("error"),
+            )
+            continue
+
+        logger.info(
+            "Python worker execution succeeded | attempt=%s | rewritten=%r | result=%r",
+            attempt,
+            rewritten_question,
+            execution_result.get("result"),
+        )
+        return {
+            "answer": _normalize_unknown_answer(_format_python_answer(execution_result)),
+            "python_code": code,
+            "python_result": execution_result,
+        }
+
+    return {
+        "answer": UNKNOWN_ANSWER,
+        "python_code": last_code,
+        "python_result": {"ok": False, "error": last_failure_reason or "retry_limit_reached"},
+    }
+
+
+def _sql_worker_node(state: AgentState) -> AgentState:
+    return _run_sql_worker(
+        upload_id=state["upload_id"],
+        rewritten_question=state["rewritten_question"],
+        context=state["context"],
+    )
+
+
+def _python_worker_node(state: AgentState) -> AgentState:
+    return _run_python_worker(
+        upload_id=state["upload_id"],
+        rewritten_question=state["rewritten_question"],
+        context=state["context"],
+    )
+
+
+def _finalize_node(state: AgentState) -> AgentState:
+    return {"answer": _normalize_unknown_answer(state.get("answer", UNKNOWN_ANSWER))}
+
+
+def _route_after_commander(state: AgentState) -> str:
+    agent = state.get("agent", "unknown")
+    if agent == "sql":
+        return "sql_worker"
+    return "python_worker"
+
+
+def _build_agent_graph():
+    graph = StateGraph(AgentState)
+    graph.add_node("commander", _commander_node)
+    graph.add_node("sql_worker", _sql_worker_node)
+    graph.add_node("python_worker", _python_worker_node)
+    graph.add_node("finalize", _finalize_node)
+    graph.add_edge(START, "commander")
+    graph.add_conditional_edges(
+        "commander",
+        _route_after_commander,
         {
-            "role": "system",
-            "content": (
-                "You are the Python worker agent finishing a dataset answer. "
-                "Answer only from the python execution result and dataset context. "
-                f"If the result does not support a grounded answer, reply with exactly: {UNKNOWN_ANSWER}. "
-                "Keep the answer concise."
-            ),
+            "sql_worker": "sql_worker",
+            "python_worker": "python_worker",
         },
-        {
-            "role": "system",
-            "content": json.dumps(
-                {
-                    "rewritten_question": rewritten_question,
-                    "python_code": code,
-                    "execution_result": execution_result,
-                },
-                ensure_ascii=True,
-            ),
-        },
-        {"role": "user", "content": rewritten_question},
-    ]
-    return _normalize_unknown_answer(_call_groq_messages(answer_messages, temperature=0.0))
+    )
+    graph.add_edge("sql_worker", "finalize")
+    graph.add_edge("python_worker", "finalize")
+    graph.add_edge("finalize", END)
+    return graph.compile()
+
+
+CHATBOT_GRAPH = _build_agent_graph()
 
 app.add_middleware(
     CORSMiddleware,
@@ -673,38 +1025,26 @@ def upload_chat(upload_id: uuid.UUID, request: ChatRequest):
     if not question:
         raise HTTPException(status_code=400, detail="Question is required.")
 
-    if not _question_appears_data_related(question, context.get("column_names", [])):
+    if _question_is_obviously_irrelevant(question):
+        logger.info("Chat rejected before commander | question=%r | reason=obviously_irrelevant", question)
         return {"answer": UNKNOWN_ANSWER, "model": None, "agent": "unknown"}
 
     try:
-        decision = _get_commander_decision(
-            question=question,
-            history=request.history,
-            context=context,
+        result = CHATBOT_GRAPH.invoke(
+            {
+                "upload_id": upload_id,
+                "question": question,
+                "history": request.history,
+                "context": context,
+            }
         )
-        agent = decision["agent"]
-        rewritten_question = decision["rewritten_question"]
-        if agent == "sql":
-            answer = _run_sql_worker(
-                upload_id=upload_id,
-                rewritten_question=rewritten_question,
-                context=context,
-            )
-        elif agent == "python":
-            answer = _run_python_worker(
-                upload_id=upload_id,
-                rewritten_question=rewritten_question,
-                context=context,
-            )
-        else:
-            answer = UNKNOWN_ANSWER
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
     return {
-        "answer": _normalize_unknown_answer(answer),
+        "answer": _normalize_unknown_answer(result.get("answer", UNKNOWN_ANSWER)),
         "model": GROQ_MODEL,
-        "agent": decision.get("agent", "unknown"),
-        "rewritten_question": decision.get("rewritten_question", question),
-        "assumptions": decision.get("assumptions", []),
+        "agent": result.get("agent", "unknown"),
+        "rewritten_question": result.get("rewritten_question", question),
+        "assumptions": result.get("assumptions", []),
     }
