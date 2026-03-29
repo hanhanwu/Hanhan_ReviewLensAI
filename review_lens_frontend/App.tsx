@@ -14,6 +14,7 @@ import {
 } from "react-native";
 
 const BACKEND_URL = "http://127.0.0.1:8000";
+const MAX_UPLOAD_BYTES = 250 * 1024;
 
 type UploadResponse = {
   upload_id: string;
@@ -50,11 +51,23 @@ type DbAggregates = {
 type ChatMessage = {
   role: "user" | "assistant";
   content: string;
+  agent?: string | null;
+  rewrittenQuestion?: string;
+  assumptions?: string[];
+  pythonCode?: string | null;
+  pythonResult?: Record<string, unknown> | null;
+  pythonLogs?: Array<Record<string, unknown>>;
 };
 
 type ChatResponse = {
   answer: string;
   model: string | null;
+  agent?: string | null;
+  rewritten_question?: string;
+  assumptions?: string[];
+  python_code?: string | null;
+  python_result?: Record<string, unknown> | null;
+  python_logs?: Array<Record<string, unknown>>;
 };
 
 const fileInputStyle: CSSProperties = {
@@ -85,6 +98,12 @@ export default function App() {
   const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) {
+      return;
+    }
+
+    if (file.size > MAX_UPLOAD_BYTES) {
+      window.alert("File size can't exceed 250 KB.");
+      event.target.value = "";
       return;
     }
 
@@ -243,7 +262,16 @@ export default function App() {
       const payload: ChatResponse = await response.json();
       setChatMessages((current) => [
         ...current,
-        { role: "assistant", content: payload.answer || "I don't know" },
+        {
+          role: "assistant",
+          content: payload.answer || "I don't know",
+          agent: payload.agent ?? null,
+          rewrittenQuestion: payload.rewritten_question,
+          assumptions: payload.assumptions ?? [],
+          pythonCode: payload.python_code ?? null,
+          pythonResult: payload.python_result ?? null,
+          pythonLogs: payload.python_logs ?? [],
+        },
       ]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Chat request failed.");
@@ -390,6 +418,50 @@ export default function App() {
                         {message.role === "user" ? "You" : "ReviewLens Bot"}
                       </Text>
                       <Text style={styles.chatText}>{message.content}</Text>
+                      {message.role === "assistant" && message.agent === "python" && (
+                        <View style={styles.debugPanel}>
+                          {message.rewrittenQuestion ? (
+                            <>
+                              <Text style={styles.debugLabel}>Rewritten Question</Text>
+                              <Text style={styles.debugText}>{message.rewrittenQuestion}</Text>
+                            </>
+                          ) : null}
+                          {message.assumptions && message.assumptions.length > 0 ? (
+                            <>
+                              <Text style={styles.debugLabel}>Assumptions</Text>
+                              <Text style={styles.debugText}>
+                                {message.assumptions.join(" | ")}
+                              </Text>
+                            </>
+                          ) : null}
+                          {message.pythonLogs && message.pythonLogs.length > 0 ? (
+                            <>
+                              <Text style={styles.debugLabel}>Python Agent Logs</Text>
+                              {message.pythonLogs.map((log, logIndex) => (
+                                <View key={`py-log-${logIndex}`} style={styles.debugLogEntry}>
+                                  <Text style={styles.debugText}>
+                                    Attempt {String(log.attempt ?? logIndex + 1)} -{" "}
+                                    {String(log.status ?? "unknown")}
+                                  </Text>
+                                  {"reason" in log && log.reason ? (
+                                    <Text style={styles.debugText}>
+                                      Reason: {String(log.reason)}
+                                    </Text>
+                                  ) : null}
+                                  {"code" in log && log.code ? (
+                                    <Text style={styles.debugCode}>{String(log.code)}</Text>
+                                  ) : null}
+                                  {"result" in log && log.result ? (
+                                    <Text style={styles.debugText}>
+                                      Result: {JSON.stringify(log.result)}
+                                    </Text>
+                                  ) : null}
+                                </View>
+                              ))}
+                            </>
+                          ) : null}
+                        </View>
+                      )}
                     </View>
                   ))
                 )}
@@ -566,6 +638,36 @@ const styles = StyleSheet.create({
     fontSize: 14,
     lineHeight: 20,
     color: "#111",
+  },
+  debugPanel: {
+    marginTop: 10,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: "#d7dce3",
+    gap: 6,
+  },
+  debugLabel: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#334155",
+    textTransform: "uppercase",
+  },
+  debugText: {
+    fontSize: 12,
+    lineHeight: 18,
+    color: "#334155",
+  },
+  debugCode: {
+    fontSize: 12,
+    lineHeight: 18,
+    color: "#0f172a",
+    backgroundColor: "#e2e8f0",
+    borderRadius: 8,
+    padding: 8,
+  },
+  debugLogEntry: {
+    gap: 4,
+    marginTop: 4,
   },
   chatInputRow: {
     marginTop: 14,

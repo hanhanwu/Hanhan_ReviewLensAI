@@ -40,6 +40,7 @@ GROQ_MODEL = "openai/gpt-oss-safeguard-20b"
 UNKNOWN_ANSWER = "I don't know"
 MAX_SQL_RESULT_ROWS = 200
 MAX_WORKER_RETRIES = 3
+MAX_UPLOAD_BYTES = 250 * 1024
 DATA_ANALYSIS_TERMS = {
     "average",
     "column",
@@ -123,6 +124,7 @@ class AgentState(TypedDict, total=False):
     sql_rows: List[Dict[str, Any]]
     python_code: str
     python_result: Dict[str, Any]
+    python_logs: List[Dict[str, Any]]
 
 
 def _require_groq_token() -> str:
@@ -666,84 +668,104 @@ def _run_python_worker(
         row["row_number"] = item["row_number"]
         dataframe_rows.append(row)
     df = pd.DataFrame(dataframe_rows)
+    del rows
+    del dataframe_rows
 
     last_code = ""
     last_failure_reason: str | None = None
-
-    for attempt in range(1, MAX_WORKER_RETRIES + 1):
-        code_generation_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a Python dataframe code writer for dataset QA. "
-                    "Write Python code using the pandas DataFrame variable df to answer the user's rewritten question. "
-                    "Set a variable named result to the final answer object. "
-                    "Use normal pandas syntax and keep the code concise and correct. "
-                    "Do not import anything. Do not access files, network, subprocesses, or system resources. "
-                    "Do not call tools. Do not return a function call. "
-                    "Return only Python code."
-                ),
-            },
-            {
-                "role": "system",
-                "content": f"Dataset context:\n{json.dumps(context, ensure_ascii=True)}",
-            },
-            {
-                "role": "user",
-                "content": _build_retry_user_prompt(
-                    rewritten_question=rewritten_question,
-                    attempt=attempt,
-                    failure_reason=last_failure_reason,
-                    previous_output=last_code or None,
-                ),
-            },
-        ]
-        code_raw = _call_groq_messages(code_generation_messages, temperature=0.0)
-        code = _extract_python_code(code_raw)
-        last_code = code
-        logger.info(
-            "Python worker generated code | attempt=%s | rewritten=%r | code=%r",
-            attempt,
-            rewritten_question,
-            code,
-        )
-        if not _is_safe_python_code(code):
-            last_failure_reason = "unsafe_code"
-            logger.warning(
-                "Python worker rejected code | attempt=%s | rewritten=%r | reason=unsafe_code",
+    python_logs: List[Dict[str, Any]] = []
+    try:
+        for attempt in range(1, MAX_WORKER_RETRIES + 1):
+            code_generation_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a Python dataframe code writer for dataset QA. "
+                        "Write Python code using the pandas DataFrame variable df to answer the user's rewritten question. "
+                        "Set a variable named result to the final answer object. "
+                        "Use normal pandas syntax and keep the code concise and correct. "
+                        "Do not import anything. Do not access files, network, subprocesses, or system resources. "
+                        "Do not call tools. Do not return a function call. "
+                        "Return only Python code."
+                    ),
+                },
+                {
+                    "role": "system",
+                    "content": f"Dataset context:\n{json.dumps(context, ensure_ascii=True)}",
+                },
+                {
+                    "role": "user",
+                    "content": _build_retry_user_prompt(
+                        rewritten_question=rewritten_question,
+                        attempt=attempt,
+                        failure_reason=last_failure_reason,
+                        previous_output=last_code or None,
+                    ),
+                },
+            ]
+            code_raw = _call_groq_messages(code_generation_messages, temperature=0.0)
+            code = _extract_python_code(code_raw)
+            last_code = code
+            logger.info(
+                "Python worker generated code | attempt=%s | rewritten=%r | code=%r",
                 attempt,
                 rewritten_question,
+                code,
             )
-            continue
+            log_entry: Dict[str, Any] = {
+                "attempt": attempt,
+                "code": code,
+            }
+            if not _is_safe_python_code(code):
+                last_failure_reason = "unsafe_code"
+                logger.warning(
+                    "Python worker rejected code | attempt=%s | rewritten=%r | reason=unsafe_code",
+                    attempt,
+                    rewritten_question,
+                )
+                log_entry["status"] = "rejected"
+                log_entry["reason"] = "unsafe_code"
+                python_logs.append(log_entry)
+                continue
 
-        execution_result = _run_python_code(code, df)
-        if not execution_result.get("ok"):
-            last_failure_reason = str(execution_result.get("error", "execution_failed"))
-            logger.warning(
-                "Python worker execution failed | attempt=%s | rewritten=%r | error=%s",
+            execution_result = _run_python_code(code, df)
+            if not execution_result.get("ok"):
+                last_failure_reason = str(execution_result.get("error", "execution_failed"))
+                logger.warning(
+                    "Python worker execution failed | attempt=%s | rewritten=%r | error=%s",
+                    attempt,
+                    rewritten_question,
+                    execution_result.get("error"),
+                )
+                log_entry["status"] = "failed"
+                log_entry["result"] = execution_result
+                python_logs.append(log_entry)
+                continue
+
+            logger.info(
+                "Python worker execution succeeded | attempt=%s | rewritten=%r | result=%r",
                 attempt,
                 rewritten_question,
-                execution_result.get("error"),
+                execution_result.get("result"),
             )
-            continue
+            log_entry["status"] = "succeeded"
+            log_entry["result"] = execution_result
+            python_logs.append(log_entry)
+            return {
+                "answer": _normalize_unknown_answer(_format_python_answer(execution_result)),
+                "python_code": code,
+                "python_result": execution_result,
+                "python_logs": python_logs,
+            }
 
-        logger.info(
-            "Python worker execution succeeded | attempt=%s | rewritten=%r | result=%r",
-            attempt,
-            rewritten_question,
-            execution_result.get("result"),
-        )
         return {
-            "answer": _normalize_unknown_answer(_format_python_answer(execution_result)),
-            "python_code": code,
-            "python_result": execution_result,
+            "answer": UNKNOWN_ANSWER,
+            "python_code": last_code,
+            "python_result": {"ok": False, "error": last_failure_reason or "retry_limit_reached"},
+            "python_logs": python_logs,
         }
-
-    return {
-        "answer": UNKNOWN_ANSWER,
-        "python_code": last_code,
-        "python_result": {"ok": False, "error": last_failure_reason or "retry_limit_reached"},
-    }
+    finally:
+        del df
 
 
 def _sql_worker_node(state: AgentState) -> AgentState:
@@ -965,10 +987,14 @@ async def upload_csv(file: UploadFile = File(...)):
     finally:
         await file.close()
 
+    if len(raw_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="File size can't exceed 250 KB.")
+
     try:
         rows_iter, finalize_stats, columns_count, column_names = _iter_csv_rows_and_stats(
             raw_bytes
         )
+        del raw_bytes
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Unable to parse the CSV file: {exc}")
 
@@ -1047,4 +1073,7 @@ def upload_chat(upload_id: uuid.UUID, request: ChatRequest):
         "agent": result.get("agent", "unknown"),
         "rewritten_question": result.get("rewritten_question", question),
         "assumptions": result.get("assumptions", []),
+        "python_code": result.get("python_code"),
+        "python_result": result.get("python_result"),
+        "python_logs": result.get("python_logs", []),
     }
