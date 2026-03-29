@@ -42,6 +42,8 @@ UNKNOWN_ANSWER = "I don't know"
 MAX_SQL_RESULT_ROWS = 200
 MAX_WORKER_RETRIES = 3
 MAX_UPLOAD_BYTES = 250 * 1024
+MAX_DISTRIBUTION_UNIQUES = 7
+MAX_DISTRIBUTION_VALUES = 7
 DATA_ANALYSIS_TERMS = {
     "average",
     "column",
@@ -1026,10 +1028,19 @@ def _iter_csv_rows_and_stats(
             "columns": 0,
             "column_names": [],
             "missing_by_column": {},
+            "low_cardinality_distributions": [],
             "rating_counts": [],
             "rating_category_counts": [],
         }
         return iter(()), (lambda: empty_stats), 0, []
+
+    unique_probe_df = pd.read_csv(BytesIO(raw_bytes))
+    distribution_column_names = {
+        str(column_name)
+        for column_name in unique_probe_df.columns
+        if int(unique_probe_df[column_name].nunique(dropna=False)) > 1
+    }
+    del unique_probe_df
 
     reader = pd.read_csv(BytesIO(raw_bytes), chunksize=2000)
 
@@ -1041,6 +1052,7 @@ def _iter_csv_rows_and_stats(
             "columns": 0,
             "column_names": [],
             "missing_by_column": {},
+            "low_cardinality_distributions": [],
             "rating_counts": [],
             "rating_category_counts": [],
         }
@@ -1053,6 +1065,9 @@ def _iter_csv_rows_and_stats(
     missing_by_column: Dict[str, int] = {name: 0 for name in column_names[:50]}
     rating_counts: Dict[str, int] = {}
     rating_category_counts: Dict[str, int] = {}
+    candidate_value_counts: Dict[str, Dict[str, int]] = {
+        name: {} for name in column_names if name in distribution_column_names
+    }
 
     def _update_aggregates(chunk: pd.DataFrame) -> None:
         nonlocal rows_count
@@ -1062,6 +1077,13 @@ def _iter_csv_rows_and_stats(
             missing = chunk.isna().sum().to_dict()
             for key in list(missing_by_column.keys()):
                 missing_by_column[key] += int(missing.get(key, 0) or 0)
+
+        for column_name, tracked_counts in candidate_value_counts.items():
+            series = chunk[column_name].astype("string").fillna("(missing)")
+            value_counts = series.value_counts()
+            for raw_value, count in value_counts.items():
+                value = str(raw_value)
+                tracked_counts[value] = tracked_counts.get(value, 0) + int(count)
 
         if "rating" in chunk.columns:
             vc = chunk["rating"].astype("string").fillna("(missing)").value_counts()
@@ -1105,12 +1127,27 @@ def _iter_csv_rows_and_stats(
         "columns": columns_count,
         "column_names": column_names,
         "missing_by_column": missing_by_column,
+        "low_cardinality_distributions": [],
         "rating_counts": [],
         "rating_category_counts": [],
     }
 
     def finalize_stats() -> Dict[str, Any]:
         backend_stats["rows"] = rows_count
+        backend_stats["low_cardinality_distributions"] = [
+            {
+                "column": column_name,
+                "values": [
+                    {"label": label, "count": count}
+                    for label, count in sorted(
+                        tracked_counts.items(),
+                        key=lambda item: (-item[1], item[0]),
+                    )[:MAX_DISTRIBUTION_VALUES]
+                ],
+            }
+            for column_name, tracked_counts in candidate_value_counts.items()
+            if tracked_counts
+        ]
         backend_stats["rating_counts"] = [
             {"rating": k, "count": rating_counts[k]}
             for k in sorted(rating_counts.keys())

@@ -28,6 +28,10 @@ type BackendStats = {
   columns: number;
   column_names: string[];
   missing_by_column: Record<string, number>;
+  low_cardinality_distributions: Array<{
+    column: string;
+    values: Array<{ label: string; count: number }>;
+  }>;
   rating_counts: Array<{ rating: string; count: number }>;
   rating_category_counts: Array<{ category: string; count: number }>;
 };
@@ -258,6 +262,46 @@ export default function App() {
 
   const hasLeftData = !!backendStats;
   const titleStyle = hasLeftData ? [styles.title, styles.titleLeft] : styles.title;
+  const lowCardinalityCharts = useMemo(() => {
+    if (!backendStats) {
+      return [];
+    }
+
+    const genericCharts = backendStats.low_cardinality_distributions ?? [];
+    if (genericCharts.length > 0) {
+      return genericCharts;
+    }
+
+    const fallbackCharts: Array<{
+      column: string;
+      values: Array<{ label: string; count: number }>;
+    }> = [];
+
+    if (backendStats.rating_counts?.length) {
+      fallbackCharts.push({
+        column: "rating",
+        values: backendStats.rating_counts.map((item) => ({
+          label: item.rating,
+          count: item.count,
+        })),
+      });
+    }
+
+    if (
+      backendStats.rating_category_counts?.length &&
+      backendStats.rating_category_counts.length <= 7
+    ) {
+      fallbackCharts.push({
+        column: "rating_category",
+        values: backendStats.rating_category_counts.map((item) => ({
+          label: item.category,
+          count: item.count,
+        })),
+      });
+    }
+
+    return fallbackCharts;
+  }, [backendStats]);
 
   const sendChatMessage = async () => {
     const question = chatInput.trim();
@@ -362,6 +406,48 @@ export default function App() {
     );
   };
 
+  const renderDistributionChart = (
+    title: string,
+    items: Array<{ label: string; value: number }>
+  ) => {
+    if (items.length === 0) {
+      return <Text style={styles.panelHint}>No distribution data available.</Text>;
+    }
+
+    const maxValue = Math.max(...items.map((item) => Number(item.value) || 0), 1);
+    const totalValue = items.reduce((sum, item) => sum + (Number(item.value) || 0), 0);
+
+    return (
+      <View style={styles.chartCard}>
+        <Text style={styles.chartTitle}>{title}</Text>
+        <View style={styles.horizontalChartArea}>
+          {items.map((item) => (
+            <View key={item.label} style={styles.horizontalChartRow}>
+              <Text style={styles.horizontalChartLabel} numberOfLines={2}>
+                {item.label}
+              </Text>
+              <View style={styles.horizontalChartTrack}>
+                <View
+                  style={[
+                    styles.horizontalChartBar,
+                    {
+                      width: `${Math.max((Number(item.value) / maxValue) * 100, 4)}%`,
+                    },
+                  ]}
+                />
+              </View>
+              <Text style={styles.horizontalChartValue} numberOfLines={1}>
+                {`${((Number(item.value) / Math.max(totalValue, 1)) * 100).toFixed(1)}% (${String(
+                  item.value
+                )})`}
+              </Text>
+            </View>
+          ))}
+        </View>
+      </View>
+    );
+  };
+
   return (
     <SafeAreaView style={styles.screen}>
       <StatusBar style="auto" />
@@ -399,12 +485,51 @@ export default function App() {
                 {loadingBackend && <Text style={styles.panelHint}>Loading...</Text>}
                 {backendStats && (
                   <View>
-                    <Text style={styles.kvLabel}>Rows</Text>
-                    <Text style={styles.kvValue}>{backendStats.rows}</Text>
-                    <Text style={styles.kvLabel}>Columns</Text>
-                    <Text style={styles.kvValue}>{backendStats.columns}</Text>
+                    <View style={styles.summaryRow}>
+                      <View style={styles.summaryCard}>
+                        <Text style={styles.kvLabel}>Rows</Text>
+                        <Text style={styles.kvValue}>{backendStats.rows}</Text>
+                      </View>
+                      <View style={styles.summaryCard}>
+                        <Text style={styles.kvLabel}>Columns</Text>
+                        <Text style={styles.kvValue}>{backendStats.columns}</Text>
+                      </View>
+                    </View>
 
-                    <Text style={styles.sectionTitle}>Top Missing Columns</Text>
+                    <Text style={styles.sectionTitle}>Columns In Data</Text>
+                    <View style={styles.columnList}>
+                      {backendStats.column_names.map((columnName) => (
+                        <Text key={columnName} style={styles.columnChip}>
+                          {columnName}
+                        </Text>
+                      ))}
+                    </View>
+
+                    <Text style={styles.sectionTitle}>Distributions</Text>
+                    {lowCardinalityCharts.length === 0 ? (
+                      <Text style={styles.panelHint}>
+                        No chartable column distributions were found.
+                      </Text>
+                    ) : (
+                      <View style={styles.distributionGrid}>
+                        {lowCardinalityCharts.map((distribution) => (
+                          <View
+                            key={distribution.column}
+                            style={styles.distributionGridItem}
+                          >
+                            {renderDistributionChart(
+                              distribution.column,
+                              distribution.values.map((item) => ({
+                                label: item.label,
+                                value: item.count,
+                              }))
+                            )}
+                          </View>
+                        ))}
+                      </View>
+                    )}
+
+                    <Text style={styles.sectionTitle}>Top Missing Values</Text>
                     {missingList.length === 0 ? (
                       <Text style={styles.panelHint}>No missing-value stats.</Text>
                     ) : (
@@ -413,28 +538,6 @@ export default function App() {
                           {col}: {count}
                         </Text>
                       ))
-                    )}
-
-                    {backendStats.rating_category_counts?.length > 0 && (
-                      <>
-                        <Text style={styles.sectionTitle}>Rating Categories</Text>
-                        {backendStats.rating_category_counts.slice(0, 8).map((r) => (
-                          <Text key={r.category} style={styles.listItem}>
-                            {r.category}: {r.count}
-                          </Text>
-                        ))}
-                      </>
-                    )}
-
-                    {backendStats.rating_counts?.length > 0 && (
-                      <>
-                        <Text style={styles.sectionTitle}>Ratings</Text>
-                        {backendStats.rating_counts.slice(0, 8).map((r) => (
-                          <Text key={r.rating} style={styles.listItem}>
-                            {r.rating}: {r.count}
-                          </Text>
-                        ))}
-                      </>
                     )}
                   </View>
                 )}
@@ -611,12 +714,37 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     color: "#111",
   },
+  summaryRow: {
+    flexDirection: "row",
+    gap: 12,
+  },
+  summaryCard: {
+    flex: 1,
+    backgroundColor: "#f8fafc",
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
   sectionTitle: {
     marginTop: 14,
     fontSize: 12,
     fontWeight: "700",
     color: "#111827",
     textTransform: "uppercase",
+  },
+  columnList: {
+    marginTop: 10,
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  columnChip: {
+    fontSize: 12,
+    color: "#334155",
+    backgroundColor: "#e2e8f0",
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
   },
   listItem: {
     marginTop: 6,
@@ -669,6 +797,12 @@ const styles = StyleSheet.create({
   chartCard: {
     marginTop: 10,
     paddingTop: 10,
+    paddingBottom: 6,
+    paddingHorizontal: 10,
+    borderWidth: 1,
+    borderStyle: "dashed",
+    borderColor: "#cbd5e1",
+    borderRadius: 12,
     gap: 6,
   },
   chartTitle: {
@@ -716,6 +850,50 @@ const styles = StyleSheet.create({
     marginTop: 4,
     fontSize: 11,
     color: "#64748b",
+  },
+  horizontalChartArea: {
+    marginTop: 10,
+    gap: 10,
+  },
+  horizontalChartRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  horizontalChartLabel: {
+    width: 88,
+    fontSize: 12,
+    color: "#334155",
+  },
+  horizontalChartTrack: {
+    flex: 1,
+    height: 14,
+    borderRadius: 999,
+    backgroundColor: "#dbe7ff",
+    overflow: "hidden",
+  },
+  horizontalChartBar: {
+    height: "100%",
+    borderRadius: 999,
+    backgroundColor: "#2563eb",
+  },
+  horizontalChartValue: {
+    width: 82,
+    fontSize: 11,
+    color: "#0f172a",
+    textAlign: "right",
+  },
+  distributionGrid: {
+    marginTop: 10,
+    flexDirection: "row",
+    flexWrap: "wrap",
+    columnGap: 20,
+    rowGap: 20,
+  },
+  distributionGridItem: {
+    flexBasis: 320,
+    flexGrow: 1,
+    minWidth: 260,
   },
   chatInputRow: {
     marginTop: 14,
