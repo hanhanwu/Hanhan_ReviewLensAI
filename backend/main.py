@@ -43,7 +43,6 @@ MAX_SQL_RESULT_ROWS = 200
 MAX_WORKER_RETRIES = 3
 MAX_UPLOAD_BYTES = 250 * 1024
 MAX_DISTRIBUTION_UNIQUES = 7
-MAX_DISTRIBUTION_VALUES = 7
 DATA_ANALYSIS_TERMS = {
     "average",
     "column",
@@ -1038,7 +1037,7 @@ def _iter_csv_rows_and_stats(
     distribution_column_names = {
         str(column_name)
         for column_name in unique_probe_df.columns
-        if int(unique_probe_df[column_name].nunique(dropna=False)) > 1
+        if 1 < int(unique_probe_df[column_name].nunique(dropna=False)) <= MAX_DISTRIBUTION_UNIQUES
     }
     del unique_probe_df
 
@@ -1142,7 +1141,7 @@ def _iter_csv_rows_and_stats(
                     for label, count in sorted(
                         tracked_counts.items(),
                         key=lambda item: (-item[1], item[0]),
-                    )[:MAX_DISTRIBUTION_VALUES]
+                    )
                 ],
             }
             for column_name, tracked_counts in candidate_value_counts.items()
